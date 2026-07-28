@@ -1,0 +1,72 @@
+name: Supabase Backup
+
+on:
+  schedule:
+    - cron: '41 4 * * *'   # every day at 04:41 UTC, change if you like
+  workflow_dispatch: {}     # lets you run it manually from the Actions tab
+
+env:
+  # How many days each backup is kept. Max 90. Mind your Actions storage
+  # quota: private repos on the free plan get 500 MB, and the retention
+  # window times your compressed dump size must stay under it.
+  RETENTION_DAYS: 7
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false      # one failing project does not stop the others
+      matrix:
+        include:
+          # One block per Supabase project.
+          # name:       a label, used in the artifact filename
+          # url_secret: name of the GitHub secret holding that project's
+          #             SESSION POOLER connection string (see README)
+          - name: project-1
+            url_secret: SUPABASE_DB_URL_PROJECT_1
+    steps:
+      - name: Refuse to run in a public repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" != "true" ]; then
+            echo "::error::This repository is public. Backups contain your database contents."
+            echo "::error::Use this template to create a PRIVATE repository and run it there."
+            exit 1
+          fi
+
+      - name: Check the connection secret exists
+        env:
+          DB_URL: ${{ secrets[matrix.url_secret] }}
+        run: |
+          if [ -z "$DB_URL" ]; then
+            echo "::error::Secret ${{ matrix.url_secret }} is missing or empty."
+            echo "::error::Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Dump roles, schema and data
+        env:
+          SUPABASE_DB_URL: ${{ secrets[matrix.url_secret] }}
+        run: |
+          mkdir -p backup
+          supabase db dump --db-url "$SUPABASE_DB_URL" -f backup/roles.sql --role-only
+          supabase db dump --db-url "$SUPABASE_DB_URL" -f backup/schema.sql
+          supabase db dump --db-url "$SUPABASE_DB_URL" -f backup/data.sql --data-only --use-copy
+
+      - name: Compress
+        run: tar -czf "${{ matrix.name }}-$(date -u +%F).tar.gz" -C backup .
+
+      - name: Store as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}-*.tar.gz
+          retention-days: ${{ env.RETENTION_DAYS }}
+          if-no-files-found: error
